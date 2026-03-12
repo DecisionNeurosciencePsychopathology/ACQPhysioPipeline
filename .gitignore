@@ -1,0 +1,7 @@
+/PreprocessedEDA/*
+*.asv
+batchmode_protocol.mat
+.matlab_prefs/*
+
+utils/panda_ttl_codes.csv
+utils/roses_ttl_codes.csv
