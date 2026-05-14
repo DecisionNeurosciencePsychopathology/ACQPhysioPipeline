@@ -2,8 +2,7 @@ participantDirPath = "...\0-Data\1-RawData";
 
 taskSegmentation = struct('name', {}, 'events', {});
 
-scriptDir = fileparts(mfilename('fullpath'));
-addpath(genpath(fullfile(scriptDir, 'utils')));
+pipelineEnv = setupPipelineEnvironment(); %#ok<NASGU>
 
 participantsFiles = string({dir(fullfile(participantDirPath, "*.acq")).name}).';
 participants = erase(participantsFiles, ".acq");

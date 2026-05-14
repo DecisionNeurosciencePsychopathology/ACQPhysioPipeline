@@ -140,8 +140,8 @@ classdef ACQParser < handle
             
             rawTTLCodes = obj.getField("Digital input");
             binWords = logical(rawTTLCodes);
-            obj.TTLStream =  bi2de(binWords,'right-msb');
-
+            % obj.TTLStream =  bi2de(binWords,'right-msb');
+            obj.TTLStream = bit2int(binWords.',size(binWords,2),false).';
         end
         
         function updateTTLLocationsAndValues(obj)

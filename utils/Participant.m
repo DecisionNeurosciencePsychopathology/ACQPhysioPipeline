@@ -1,7 +1,7 @@
 classdef Participant < handle
     properties (Constant)
         defaultSourcesToExtract = {'ECG','EDA'};
-        saveDirectoryName = "DataProcessed\ByParticipant"
+        saveDirectoryName = fullfile("DataProcessed","ByParticipant")
     end
 
     properties 
