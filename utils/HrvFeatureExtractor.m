@@ -36,6 +36,7 @@ classdef HrvFeatureExtractor < handle
                 opts.baselineFallbackMethod (1,1) string = "firstAvailable"
                 opts.minDurationForSpectrumSec (1,1) double = 1
                 opts.interpHz (1,1) double = 4
+                opts.baselineWindowSec = []
             end
 
             tonicFeatures = obj.getTonicFeatures(opts);
@@ -418,6 +419,16 @@ classdef HrvFeatureExtractor < handle
                 return
             end
 
+            fixedBaselineWindowSec = [];
+            if isfield(opts, 'baselineWindowSec')
+                fixedBaselineWindowSec = HrvFeatureExtractor.normalizeBaselineWindowSec(opts.baselineWindowSec);
+            end
+            if ~isempty(fixedBaselineWindowSec)
+                [baselineSelection, hasBaseline] = obj.selectWindowFromFixedBounds( ...
+                    baselineTable, fixedBaselineWindowSec);
+                return
+            end
+
             baselineDuration = opts.baselineDurationSec;
             baselineMethod = lower(strtrim(string(opts.baselineMethod)));
             fallbackMethod = lower(strtrim(string(opts.baselineFallbackMethod)));
@@ -518,6 +529,26 @@ classdef HrvFeatureExtractor < handle
             hasSelection = ~isempty(selection);
         end
 
+        function [selection, hasSelection] = selectWindowFromFixedBounds(~, baselineTable, baselineWindowSec)
+            timestampSec = baselineTable.Timestamp;
+            if isduration(timestampSec)
+                timestampSec = seconds(timestampSec);
+            end
+
+            timestampSec = double(timestampSec(:));
+            selection = table();
+            hasSelection = false;
+            if isempty(timestampSec)
+                return
+            end
+
+            mask = isfinite(timestampSec) & ...
+                timestampSec >= baselineWindowSec(1) & ...
+                timestampSec <= baselineWindowSec(2);
+            selection = baselineTable(mask, :);
+            hasSelection = ~isempty(selection);
+        end
+
         function [selection, hasSelection] = applyBaselineFallback(obj, baselineTable, durationSec, fallbackMethod)
             switch fallbackMethod
                 case {"firstavailable","fromstart","start"}
@@ -613,6 +644,32 @@ classdef HrvFeatureExtractor < handle
     end
 
     methods (Static, Access=private)
+        function baselineWindowSec = normalizeBaselineWindowSec(rawWindow)
+            baselineWindowSec = [];
+            if isempty(rawWindow)
+                return
+            end
+
+            if isduration(rawWindow)
+                rawWindow = seconds(rawWindow);
+            end
+
+            rawWindow = double(rawWindow(:).');
+            if numel(rawWindow) ~= 2 || any(~isfinite(rawWindow))
+                warning('HrvFeatureExtractor:InvalidBaselineWindowSec', ...
+                    'baselineWindowSec must be a finite two-element numeric vector.');
+                return
+            end
+
+            if rawWindow(2) <= rawWindow(1)
+                warning('HrvFeatureExtractor:InvalidBaselineWindowSec', ...
+                    'baselineWindowSec end time must be greater than start time.');
+                return
+            end
+
+            baselineWindowSec = rawWindow;
+        end
+
         function extension = getSaveExtension(saveMode)
             switch saveMode
                 case "asCSV"

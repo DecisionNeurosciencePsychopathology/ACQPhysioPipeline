@@ -232,6 +232,9 @@ classdef ECGRriArtifactRejectionService < handle
 
             inspector = ECGManualInspector(obj.sourceECG.ECG, obj.fs, peaksInit, optsReview);
             inspector.run();
+            if inspector.wasCancelled()
+                return
+            end
             [peaksReviewed, editLog, qc, figHandles] = inspector.exportResults();
             [rriPeaksIdx, rriInvalidIdx] = inspector.exportRriEdits();
 

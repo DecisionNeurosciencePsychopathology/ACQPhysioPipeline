@@ -20,6 +20,8 @@ classdef ECGManualInspector < handle
         peaksAmp
         uiActive = false
         ecgTimestamps
+        initialUiState
+        cancelled = false
     end
 
     methods
@@ -81,6 +83,8 @@ classdef ECGManualInspector < handle
             obj.undoStack = {};
             obj.redoStack = {};
             obj.ui = [];
+            obj.initialUiState = struct();
+            obj.cancelled = false;
         end
 
         function run(obj)
@@ -108,6 +112,9 @@ classdef ECGManualInspector < handle
                     obj.ui.drawPsdPlot();
                 end
             end
+            obj.initialUiState = obj.captureState();
+            obj.undoStack = {};
+            obj.redoStack = {};
 
             hControl = findobj('Tag', 'FigureEkgControl');
             if ~isempty(hControl) && ishandle(hControl)
@@ -117,6 +124,13 @@ classdef ECGManualInspector < handle
                 if ~isempty(hPlot) && ishandle(hPlot)
                     waitfor(hPlot);
                 end
+            end
+
+            if obj.cancelled
+                obj.restoreInitialUiState();
+                obj.qcAfter = obj.computeQC(obj.peaksIdx);
+                obj.uiActive = false;
+                return
             end
 
             if obj.opts.returnFigures
@@ -133,7 +147,22 @@ classdef ECGManualInspector < handle
         end
 
         function deletePeak(obj, sampleIdx, note)
-            obj.applyEdit("delete", sampleIdx, sampleIdx, note);
+            obj.deletePeaks(sampleIdx, note);
+        end
+
+        function deletePeaks(obj, sampleIdx, note)
+            if nargin < 3
+                note = "";
+            end
+
+            [peakBefore, peakAfter] = obj.applyDeleteBatch(sampleIdx);
+            if isempty(peakBefore)
+                return
+            end
+
+            obj.refreshRriForCurrentWindow();
+            obj.appendLog("delete", peakBefore, peakAfter, note, "ecg_peak");
+            obj.syncUiAfterEdit();
         end
 
         function movePeak(obj, oldSampleIdx, newSampleIdx, note, varargin)
@@ -153,6 +182,11 @@ classdef ECGManualInspector < handle
             obj.peaksAmp(peakPos) = newAmplitude;
             obj.appendLog("move_amp", sampleIdx, sampleIdx, note, "ecg_peak");
             obj.syncUiAfterEdit();
+        end
+
+        function beginUiEdit(obj)
+            obj.pushUndoState();
+            obj.redoStack = {};
         end
 
         function logRriEdit(obj, action, peakBefore, peakAfter, note, editTarget)
@@ -191,6 +225,28 @@ classdef ECGManualInspector < handle
             obj.syncUiAfterEdit();
         end
 
+        function startOver(obj)
+            obj.restoreInitialUiState();
+            obj.undoStack = {};
+            obj.redoStack = {};
+            obj.cancelled = false;
+            obj.syncUiAfterEdit();
+        end
+
+        function cancelReview(obj)
+            obj.restoreInitialUiState();
+            obj.undoStack = {};
+            obj.redoStack = {};
+            obj.cancelled = true;
+            if obj.uiActive
+                obj.syncGlobalPeaks();
+            end
+        end
+
+        function tf = wasCancelled(obj)
+            tf = obj.cancelled;
+        end
+
         function [peaksReviewed, editLog, qc, figHandles] = exportResults(obj)
             peaksReviewed = obj.peaksIdx(:);
             editLog = obj.editLog;
@@ -226,6 +282,10 @@ classdef ECGManualInspector < handle
             if isempty(peaksIdx)
                 obj.peaksIdx = zeros(0, 1);
                 obj.peaksAmp = zeros(0, 1);
+                if obj.uiActive
+                    obj.resetRriToEcg();
+                    obj.syncGlobalPeaks();
+                end
                 return
             end
             peaksIdx = obj.sanitizePeaks(peaksIdx, numel(obj.ecg));
@@ -234,6 +294,10 @@ classdef ECGManualInspector < handle
                 peaksAmp = obj.ecg(peaksIdx);
             end
             [obj.peaksIdx, obj.peaksAmp] = obj.sortPeaks(peaksIdx, peaksAmp);
+            if obj.uiActive
+                obj.resetRriToEcg();
+                obj.syncGlobalPeaks();
+            end
         end
     end
 
@@ -311,7 +375,7 @@ classdef ECGManualInspector < handle
             end
 
             if action == "insert" || action == "delete" || action == "move"
-                obj.resetRriToEcg();
+                obj.refreshRriForCurrentWindow();
             end
 
             obj.appendLog(action, peakBefore, peakAfter, note, "ecg_peak");
@@ -343,6 +407,34 @@ classdef ECGManualInspector < handle
             obj.peaksAmp(pos) = [];
         end
 
+        function [peakBefore, peakAfter] = applyDeleteBatch(obj, sampleIdx)
+            peakBefore = zeros(0,1);
+            peakAfter = zeros(0,1);
+            if isempty(obj.peaksIdx) || isempty(sampleIdx)
+                return
+            end
+
+            requestedPeaks = obj.sanitizePeaks(sampleIdx, numel(obj.ecg));
+            if isempty(requestedPeaks)
+                return
+            end
+
+            [isExistingPeak, positions] = ismember(requestedPeaks, obj.peaksIdx);
+            positions = positions(isExistingPeak);
+            if isempty(positions)
+                return
+            end
+
+            positions = unique(positions, 'stable');
+            peakBefore = obj.peaksIdx(positions);
+            peakAfter = peakBefore;
+
+            obj.pushUndoState();
+            obj.redoStack = {};
+            obj.peaksIdx(positions) = [];
+            obj.peaksAmp(positions) = [];
+        end
+
         function applyMove(obj, oldSampleIdx, newSampleIdx, newAmplitude)
             if isempty(obj.peaksIdx)
                 return
@@ -367,14 +459,68 @@ classdef ECGManualInspector < handle
         end
 
         function state = captureState(obj)
+            global EKG;
             state = struct();
             state.peaksIdx = obj.peaksIdx;
             state.peaksAmp = obj.peaksAmp;
+            state.editLog = obj.editLog;
+            state.reviewLog = obj.reviewLog;
+            state.flaggedWindows = obj.flaggedWindows;
+            state.hasEkgState = ~isempty(EKG) && isstruct(EKG);
+            if state.hasEkgState
+                state.ekg = struct();
+                state.ekg.rriCustomActive = ECGManualInspector.getStructField(EKG, 'rriCustomActive', false);
+                state.ekg.rriPeaksIdx = ECGManualInspector.getStructField(EKG, 'rriPeaksIdx', []);
+                state.ekg.rriInvalidIdx = ECGManualInspector.getStructField(EKG, 'rriInvalidIdx', []);
+                state.ekg.rriCapSampleIdx = ECGManualInspector.getStructField(EKG, 'rriCapSampleIdx', zeros(0,1));
+                state.ekg.rriCapValuesMs = ECGManualInspector.getStructField(EKG, 'rriCapValuesMs', zeros(0,1));
+                state.ekg.plot = ECGManualInspector.getStructField(EKG, 'plot', struct());
+                state.ekg.threshold = ECGManualInspector.getStructField(EKG, 'threshold', []);
+                state.ekg.HF_lower = ECGManualInspector.getStructField(EKG, 'HF_lower', []);
+                state.ekg.HF_upper = ECGManualInspector.getStructField(EKG, 'HF_upper', []);
+                state.ekg.RSPpointDown = ECGManualInspector.getStructField(EKG, 'RSPpointDown', []);
+                state.ekg.RSPpointUp = ECGManualInspector.getStructField(EKG, 'RSPpointUp', []);
+                state.ekg.rspBoundExists = ECGManualInspector.getStructField(EKG, 'rspBoundExists', []);
+            end
         end
 
         function restoreState(obj, state)
+            global EKG;
             obj.peaksIdx = state.peaksIdx;
             obj.peaksAmp = state.peaksAmp;
+            if isfield(state, 'editLog')
+                obj.editLog = state.editLog;
+            end
+            if isfield(state, 'reviewLog')
+                obj.reviewLog = state.reviewLog;
+            end
+            if isfield(state, 'flaggedWindows')
+                obj.flaggedWindows = state.flaggedWindows;
+            end
+            if isfield(state, 'hasEkgState') && state.hasEkgState && ...
+                    isfield(state, 'ekg') && ~isempty(EKG) && isstruct(EKG)
+                EKG.rriCustomActive = state.ekg.rriCustomActive;
+                EKG.rriPeaksIdx = state.ekg.rriPeaksIdx;
+                EKG.rriInvalidIdx = state.ekg.rriInvalidIdx;
+                EKG.rriCapSampleIdx = state.ekg.rriCapSampleIdx;
+                EKG.rriCapValuesMs = state.ekg.rriCapValuesMs;
+                if isfield(state.ekg, 'plot') && ~isempty(state.ekg.plot)
+                    EKG.plot = state.ekg.plot;
+                end
+                restoreFields = {'threshold','HF_lower','HF_upper','RSPpointDown','RSPpointUp','rspBoundExists'};
+                for iField = 1:numel(restoreFields)
+                    fieldName = restoreFields{iField};
+                    if isfield(state.ekg, fieldName) && ~isempty(state.ekg.(fieldName))
+                        EKG.(fieldName) = state.ekg.(fieldName);
+                    end
+                end
+            end
+        end
+
+        function restoreInitialUiState(obj)
+            if isstruct(obj.initialUiState) && isfield(obj.initialUiState, 'peaksIdx')
+                obj.restoreState(obj.initialUiState);
+            end
         end
 
         function appendLog(obj, action, peakBefore, peakAfter, note, editTarget)
@@ -482,7 +628,7 @@ classdef ECGManualInspector < handle
             EKG.threshold = std(EKG.signal);
             EKG.plot.maxTime = length(EKG.signal)/EKG.sampRate;
             initialWindow = min(60, EKG.plot.maxTime);
-            startTime = max(0, (EKG.plot.maxTime - initialWindow) / 2);
+            startTime = 0;
             EKG.plot.startTime = startTime;
             EKG.plot.widthTime = initialWindow;
             EKG.plot.endTime = EKG.plot.startTime + EKG.plot.widthTime;
@@ -557,11 +703,13 @@ classdef ECGManualInspector < handle
                 EKG.ibis = [];
                 EKG.ibi_spline = [];
                 EKG.ibi_spline_t = [];
+                EKG.indxPeaks = [];
                 return
             end
 
             EKG.peaks = [obj.peaksIdx(:) obj.peaksAmp(:)];
             EKG.t_peaks = EKG.peaks(:,1)/EKG.sampRate;
+            EKG.indxPeaks = find(EKG.t_peaks >= EKG.plot.startTime & EKG.t_peaks <= EKG.plot.endTime);
             if ~isfield(EKG, 'rriCustomActive') || ~EKG.rriCustomActive
                 EKG.rriPeaksIdx = EKG.peaks(:,1);
             end
@@ -581,7 +729,6 @@ classdef ECGManualInspector < handle
             yy = spline(t, y, xx);
             EKG.ibi_spline = yy;
             EKG.ibi_spline_t = xx + x(1);
-            EKG.indxPeaks = find(EKG.t_peaks >= EKG.plot.startTime & EKG.t_peaks <= EKG.plot.endTime);
         end
 
         function syncUiAfterEdit(obj)
@@ -593,6 +740,51 @@ classdef ECGManualInspector < handle
                 obj.ui.drawIbiPlot();
                 obj.ui.drawPsdPlot();
                 obj.ui.drawEkgPlot();
+            end
+        end
+
+        function refreshRriForCurrentWindow(obj)
+            global EKG;
+            if isempty(EKG) || ~isstruct(EKG) || ~isfield(EKG, 'plot') || ...
+                    ~isfield(EKG, 'sampRate') || isempty(obj.peaksIdx)
+                obj.resetRriToEcg();
+                return
+            end
+
+            nSamples = numel(obj.ecg);
+            windowStart = max(1, floor(EKG.plot.startTime * EKG.sampRate) + 1);
+            windowEnd = min(nSamples, ceil(EKG.plot.endTime * EKG.sampRate));
+            if windowEnd < windowStart
+                windowEnd = windowStart;
+            end
+
+            currentPeaks = obj.sanitizePeaks(obj.peaksIdx, nSamples);
+            if isfield(EKG, 'rriCustomActive') && EKG.rriCustomActive && ...
+                    isfield(EKG, 'rriPeaksIdx') && ~isempty(EKG.rriPeaksIdx)
+                baseRriPeaks = obj.sanitizePeaks(EKG.rriPeaksIdx, nSamples);
+            else
+                baseRriPeaks = currentPeaks;
+            end
+
+            outsideMask = baseRriPeaks < windowStart | baseRriPeaks > windowEnd;
+            insideCurrent = currentPeaks(currentPeaks >= windowStart & currentPeaks <= windowEnd);
+            rriPeaksIdx = obj.sanitizePeaks([baseRriPeaks(outsideMask); insideCurrent(:)], nSamples);
+
+            invalidIdx = zeros(0,1);
+            if isfield(EKG, 'rriInvalidIdx') && ~isempty(EKG.rriInvalidIdx)
+                invalidIdx = obj.sanitizePeaks(EKG.rriInvalidIdx, nSamples);
+                invalidIdx = invalidIdx(invalidIdx < windowStart | invalidIdx > windowEnd);
+            end
+            invalidIdx = ECGManualInspector.sanitizeInvalidRriIdx(invalidIdx, rriPeaksIdx);
+
+            EKG.rriCustomActive = true;
+            EKG.rriPeaksIdx = rriPeaksIdx;
+            EKG.rriInvalidIdx = invalidIdx;
+            if ~isfield(EKG, 'rriCapSampleIdx') || isempty(EKG.rriCapSampleIdx)
+                EKG.rriCapSampleIdx = zeros(0,1);
+            end
+            if ~isfield(EKG, 'rriCapValuesMs') || isempty(EKG.rriCapValuesMs)
+                EKG.rriCapValuesMs = zeros(0,1);
             end
         end
 
@@ -664,6 +856,27 @@ classdef ECGManualInspector < handle
     end
 
     methods (Static)
+        function value = getStructField(source, fieldName, defaultValue)
+            if isstruct(source) && isfield(source, fieldName)
+                value = source.(fieldName);
+            else
+                value = defaultValue;
+            end
+        end
+
+        function invalidIdx = sanitizeInvalidRriIdx(invalidIdx, rriPeaksIdx)
+            if isempty(invalidIdx) || isempty(rriPeaksIdx) || numel(rriPeaksIdx) < 2
+                invalidIdx = zeros(0,1);
+                return
+            end
+            invalidIdx = double(invalidIdx(:));
+            invalidIdx = invalidIdx(isfinite(invalidIdx));
+            invalidIdx = round(invalidIdx);
+            validIbiPeaks = double(rriPeaksIdx(2:end));
+            invalidIdx = invalidIdx(ismember(invalidIdx, validIbiPeaks));
+            invalidIdx = unique(invalidIdx, 'stable');
+        end
+
         function editLog = initEditLogTable()
             editLog = table('Size', [0 10], ...
                 'VariableTypes', {'datetime','string','double','double','string','string','string','string','string','string'}, ...
