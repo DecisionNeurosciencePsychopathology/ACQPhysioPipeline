@@ -142,6 +142,7 @@ classdef ACQParser < handle
             binWords = logical(rawTTLCodes);
             % obj.TTLStream =  bi2de(binWords,'right-msb');
             obj.TTLStream = bit2int(binWords.',size(binWords,2),false).';
+
         end
         
         function updateTTLLocationsAndValues(obj)
@@ -156,13 +157,14 @@ classdef ACQParser < handle
     
             % Currently invalidating for PANDA because found many ROSES
             % codes that are not present in the reference file
-            if ~all(invalidTTL==0) && strcmp(obj.experimentName,"PANDA")
+            if all(invalidTTL==1) && strcmp(obj.experimentName,"PANDA")
                 obj.validTTL = false;
+                fprintf("Found unique codes: %i \n",unique(obj.decimalTTL));
                 % error("Found invalid TTLs");
             else
                 obj.validTTL = true;
             end
-
+            
         end
         
         function correctSingleZeroBetweenValidTTLs(obj)

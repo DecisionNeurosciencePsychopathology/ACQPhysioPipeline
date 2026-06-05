@@ -2,6 +2,7 @@ classdef Participant < handle
     properties (Constant)
         defaultSourcesToExtract = {'ECG','EDA'};
         saveDirectoryName = fullfile("DataProcessed","ByParticipant")
+        overrideSaveDirPath = ""
     end
 
     properties 
@@ -18,6 +19,7 @@ classdef Participant < handle
         taskSegmentation
         sourcesToExtract = Participant.defaultSourcesToExtract
         segmentationProvided 
+        rriBaselineWindowSec = []
     end
     
     properties (Access=private)
@@ -44,6 +46,9 @@ classdef Participant < handle
                 opts.ecgQCSaveDir = ""
                 opts.taskSegmentation = struct('name', {}, 'events', {});
                 opts.sourcesToExtract = Participant.defaultSourcesToExtract
+                opts.baselineDurationSec (1,1) double = 300
+                opts.baselineMethod (1,1) string = "preFirstEvent"
+                opts.baselineFallbackMethod (1,1) string = "firstAvailable"
             end
 
             obj.saveResults = Participant.parseSaveSelection(opts.save);
@@ -64,9 +69,16 @@ classdef Participant < handle
             obj.getData();
             if obj.invalidParticipant; return; end
             obj.setEventArrays();
+            obj.rriBaselineWindowSec = obj.computeRriBaselineWindow( ...
+                opts.baselineDurationSec, opts.baselineMethod, opts.baselineFallbackMethod);
+            obj.printPandaManualBaselineWindow(opts.ecgArtifactRejectionMethod);
+            obj.printPandaLastEventTime(opts.ecgArtifactRejectionMethod);
             obj.preprocessData(opts);
             obj.segmentData();
-            obj.extractHrvFeatures();
+            obj.extractHrvFeatures( ...
+                baselineDurationSec = opts.baselineDurationSec, ...
+                baselineMethod = opts.baselineMethod, ...
+                baselineFallbackMethod = opts.baselineFallbackMethod);
             if Participant.hasAnySaveEnabled(obj.saveResults)
                 obj.save();
             end
@@ -155,11 +167,16 @@ classdef Participant < handle
                 opts.baselineFallbackMethod (1,1) string = "firstAvailable"
                 opts.minDurationForSpectrumSec (1,1) double = 1
                 opts.interpHz (1,1) double = 4
+                opts.baselineWindowSec = []
             end
 
             eventArray = [];
             if ~isempty(obj.acqParser)
                 eventArray = obj.acqParser.TTLsummary;
+            end
+
+            if isempty(opts.baselineWindowSec) && ~isempty(obj.rriBaselineWindowSec)
+                opts.baselineWindowSec = obj.rriBaselineWindowSec;
             end
 
             obj.hrvExtractor = HrvFeatureExtractor( ...
@@ -231,8 +248,159 @@ classdef Participant < handle
     
     methods (Access=private)
         function prepareSaveDirectory(obj)
-            [dataDirectory,~,~] = fileparts(obj.participantDataPath);
-            obj.saveDir = fullfile(dataDirectory,"..",Participant.saveDirectoryName,string(obj.participantId));
+            if strlength(obj.overrideSaveDirPath) > 0 && isfolder(obj.overrideSaveDirPath)
+                dataDirectory = obj.overrideSaveDirPath;
+                obj.saveDir = fullfile(dataDirectory,Participant.saveDirectoryName,string(obj.participantId));
+            else
+                [dataDirectory,~,~] = fileparts(obj.participantDataPath);
+                obj.saveDir = fullfile(dataDirectory,"..",Participant.saveDirectoryName,string(obj.participantId));
+            end
+        end
+
+        function printPandaManualBaselineWindow(obj, ecgArtifactRejectionMethod)
+            if ~strcmpi(string(obj.experimentName), "PANDA")
+                return
+            end
+
+            mode = Participant.normalizeOptionToken(ecgArtifactRejectionMethod);
+            if ~any(mode == ["manual", "semiauto", "semiautomatic"])
+                return
+            end
+
+            baselineWindowSec = obj.rriBaselineWindowSec;
+            if isempty(baselineWindowSec)
+                warning('Participant:PandaBaselineWindowUnavailable', ...
+                    ['Could not compute a PANDA RRI baseline window before ECG review ', ...
+                     'for participant %s.'], char(string(obj.participantId)));
+                return
+            end
+
+            startSec = double(baselineWindowSec(1));
+            endSec = double(baselineWindowSec(2));
+            if ~isfinite(startSec) || ~isfinite(endSec)
+                return
+            end
+
+            fprintf(['PANDA participant %s RRI baseline window (%s ECG review): ', ...
+                'start %.3f sec, end %.3f sec\n'], ...
+                char(string(obj.participantId)), char(mode), startSec, endSec);
+        end
+
+        function printPandaLastEventTime(obj, ecgArtifactRejectionMethod)
+            if ~strcmpi(string(obj.experimentName), "PANDA")
+                return
+            end
+
+            mode = Participant.normalizeOptionToken(ecgArtifactRejectionMethod);
+            if ~any(mode == ["manual", "semiauto", "semiautomatic"])
+                return
+            end
+
+            lastEventTime = obj.acqParser.TTLsummary(end).time;
+            if ~isfinite(lastEventTime) 
+                return
+            end
+
+            fprintf(['PANDA participant %s last event time: ', ...
+                ' %.3f sec\n'], ...
+                char(string(obj.participantId)), lastEventTime);
+        end
+
+        function baselineWindowSec = computeRriBaselineWindow(obj, baselineDurationSec, ...
+                baselineMethod, baselineFallbackMethod)
+            baselineWindowSec = [];
+
+            if ~isfield(obj.sources, 'ECG') || isempty(obj.sources.ECG)
+                return
+            end
+
+            ecgSource = obj.sources.ECG;
+            if ~isprop(ecgSource, 'data') || isempty(ecgSource.data) || ...
+                    ~isprop(ecgSource, 'fs')
+                return
+            end
+
+            samplingFrequency = double(ecgSource.fs);
+            if ~isscalar(samplingFrequency) || ~isfinite(samplingFrequency) || samplingFrequency <= 0
+                return
+            end
+
+            recordingEndSec = (numel(ecgSource.data) - 1) / samplingFrequency;
+            baselineDurationSec = double(baselineDurationSec);
+            if ~isfinite(recordingEndSec) || recordingEndSec <= 0 || ...
+                    ~isfinite(baselineDurationSec) || baselineDurationSec <= 0
+                return
+            end
+
+            method = Participant.normalizeOptionToken(baselineMethod);
+            fallbackMethod = Participant.normalizeOptionToken(baselineFallbackMethod);
+
+            switch method
+                case "prefirstevent"
+                    [baselineWindowSec, hasWindow] = obj.computePreFirstEventBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+                case {"firstavailable", "fromstart", "start"}
+                    [baselineWindowSec, hasWindow] = Participant.computeFirstAvailableBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+                case {"lastavailable", "fromend", "end"}
+                    [baselineWindowSec, hasWindow] = Participant.computeLastAvailableBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+                otherwise
+                    warning('Participant:UnknownBaselineMethod', ...
+                        'Unknown baselineMethod "%s"; using preFirstEvent.', string(baselineMethod));
+                    [baselineWindowSec, hasWindow] = obj.computePreFirstEventBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+            end
+
+            if hasWindow
+                baselineWindowSec = Participant.clampBaselineWindow( ...
+                    baselineWindowSec, 0, recordingEndSec);
+                hasWindow = ~isempty(baselineWindowSec);
+            end
+
+            if ~hasWindow
+                [baselineWindowSec, hasWindow] = Participant.computeFallbackBaselineWindow( ...
+                    recordingEndSec, baselineDurationSec, fallbackMethod);
+            end
+
+            if hasWindow
+                baselineWindowSec = Participant.clampBaselineWindow( ...
+                    baselineWindowSec, 0, recordingEndSec);
+            end
+        end
+
+        function [baselineWindowSec, hasWindow] = computePreFirstEventBaselineWindow(obj, ...
+                recordingEndSec, baselineDurationSec)
+            baselineWindowSec = [];
+            hasWindow = false;
+
+            eventTimes = [];
+            if ~isempty(obj.acqParser)
+                ttlSummary = obj.acqParser.TTLsummary;
+                if isstruct(ttlSummary) && isfield(ttlSummary, 'time')
+                    % Drop the rows with no name, belonging to the invalid
+                    % codes present in the summary
+                    keepRows = arrayfun(@(s) ischar(s.name) && ~isempty(s.name), ttlSummary);
+                    ttlSummary = ttlSummary(keepRows);
+                    eventTimes = double([ttlSummary.time]);
+                elseif istable(ttlSummary) && ismember('time', ttlSummary.Properties.VariableNames)
+                    eventTimes = double(ttlSummary.time);
+                end
+                eventTimes = eventTimes(isfinite(eventTimes));
+            end
+
+            if isempty(eventTimes)
+                return
+            end
+
+            earliestEventTime = min(eventTimes);
+            if earliestEventTime < baselineDurationSec
+                return
+            end
+
+            baselineWindowSec = [earliestEventTime - baselineDurationSec, earliestEventTime];
+            baselineWindowSec = Participant.clampBaselineWindow(baselineWindowSec, 0, recordingEndSec);
+            hasWindow = ~isempty(baselineWindowSec);
         end
 
         function getACQParser(obj)
@@ -438,8 +606,9 @@ classdef Participant < handle
                 % Example: 102_MP_Physio_S1
                 obj.experimentName = 'ROSES';
         
-            elseif ~isempty(regexp(name, '^\d+$', 'once'))
-                % Example: 440428
+            % elseif ~isempty(regexp(name, '^\d+$', 'once'))
+            elseif ~isempty(regexp(name, '^\d+([_-]\d+)?$', 'once'))
+                % Example: 440428 or 440428_1
                 obj.experimentName = 'PANDA';
         
             else
@@ -462,6 +631,78 @@ classdef Participant < handle
     end
     
     methods (Static, Access=private)
+        function token = normalizeOptionToken(rawValue)
+            token = lower(regexprep(strtrim(string(rawValue)), '[\s_\-]', ''));
+            token = token(:);
+            token = token(token ~= "");
+            if isempty(token)
+                token = "";
+            else
+                token = token(1);
+            end
+        end
+
+        function [baselineWindowSec, hasWindow] = computeFirstAvailableBaselineWindow( ...
+                recordingEndSec, baselineDurationSec)
+            endSec = min(recordingEndSec, baselineDurationSec);
+            baselineWindowSec = [0, endSec];
+            hasWindow = endSec > 0;
+            if ~hasWindow
+                baselineWindowSec = [];
+            end
+        end
+
+        function [baselineWindowSec, hasWindow] = computeLastAvailableBaselineWindow( ...
+                recordingEndSec, baselineDurationSec)
+            startSec = max(0, recordingEndSec - baselineDurationSec);
+            baselineWindowSec = [startSec, recordingEndSec];
+            hasWindow = recordingEndSec > startSec;
+            if ~hasWindow
+                baselineWindowSec = [];
+            end
+        end
+
+        function [baselineWindowSec, hasWindow] = computeFallbackBaselineWindow( ...
+                recordingEndSec, baselineDurationSec, fallbackMethod)
+            switch fallbackMethod
+                case {"firstavailable", "fromstart", "start", ""}
+                    [baselineWindowSec, hasWindow] = Participant.computeFirstAvailableBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+                case {"lastavailable", "fromend", "end"}
+                    [baselineWindowSec, hasWindow] = Participant.computeLastAvailableBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+                case {"fullrecording", "all", "entire"}
+                    baselineWindowSec = [0, recordingEndSec];
+                    hasWindow = recordingEndSec > 0;
+                case {"none", "off"}
+                    baselineWindowSec = [];
+                    hasWindow = false;
+                otherwise
+                    warning('Participant:UnknownBaselineFallbackMethod', ...
+                        'Unknown baselineFallbackMethod "%s"; using firstAvailable.', fallbackMethod);
+                    [baselineWindowSec, hasWindow] = Participant.computeFirstAvailableBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+            end
+        end
+
+        function baselineWindowSec = clampBaselineWindow(baselineWindowSec, minSec, maxSec)
+            if isempty(baselineWindowSec)
+                return
+            end
+
+            baselineWindowSec = double(baselineWindowSec(:).');
+            if numel(baselineWindowSec) ~= 2 || any(~isfinite(baselineWindowSec))
+                baselineWindowSec = [];
+                return
+            end
+
+            baselineWindowSec(1) = max(minSec, baselineWindowSec(1));
+            baselineWindowSec(2) = min(maxSec, baselineWindowSec(2));
+            if baselineWindowSec(2) <= baselineWindowSec(1)
+                baselineWindowSec = [];
+            end
+        end
+
         function saveSelection = parseSaveSelection(saveOption)
             if islogical(saveOption) && isscalar(saveOption)
                 if saveOption

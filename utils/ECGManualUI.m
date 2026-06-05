@@ -19,34 +19,12 @@ function addPeak(obj, direction)
 
 global EKG;
 
+selected_peak = obj.getSingleSelectedEcgPeakIdx(true);
+if isempty(selected_peak)
+    return
+end
+
 axes(findobj('Tag', 'AxesEkgPlot'));
-
-% find 'o's if present
-h = findobj(gca,'Type','text');
-
-% find selected peak which is red and has 'yellow' stored in userdata
-numPeaks = numel(h);
-%disp(['Length(h): ' num2str(numPeaks)]);
-selected_peak = [];
-
-for iPeak = 1:numPeaks
-	test = get(h(iPeak),'userdata');  %gets peaks from right to left
-%    disp([num2str(iPeak) ':  ' mat2str(test)]);
-    if sum(test == [1 1 0]) > 2   %yellow
-        selected_peak = [selected_peak EKG.indxPeaks(numPeaks-(iPeak-1))];
-    end
-end
-%disp(['Selected peak(s): ' mat2str(selected_peak)]);
-% if there's more than one selected peak we have a problem
-if length(selected_peak) > 1
-    warndlg('More than one peak is selected. Try again.','Warning!');
-    return
-end
-% if there's no selected peak we have a problem
-if length(selected_peak) < 1
-    warndlg('A peak must be selected. Try again.','Warning!');
-    return
-end
 
 % EKG.indxPeaks contains the indices of the plotted peaks so selected peak is really EKG.indxPeaks(selected_peak)
 %selected_peak = EKG.indxPeaks(selected_peak);
@@ -124,7 +102,7 @@ EKG.ibi_spline = yy;
 EKG.ibi_spline_t = xx+x(1);
 
 % remove 'o's if present
-h = findobj(gca,'Type','text');
+h = findobj(gca,'Type','text','-regexp','Tag','^peak[0-9]+$');
 if ~isempty(h)
     delete(h);        
 end
@@ -170,38 +148,17 @@ function deletePeak(obj)
 
 global EKG;
 
+selected_peak = obj.getSelectedEcgPeakIdx(true);
+if isempty(selected_peak)
+    return
+end
+
 axes(findobj('Tag', 'AxesEkgPlot'));
-
-% find 'o's if present
-h = findobj(gca,'Type','text');
-
-% find selected peak which is red and has 'yellow' stored in userdata
-numPeaks = numel(h);
-%disp(['Length(h): ' num2str(numPeaks)]);
-selected_peak = [];
-
-for iPeak = 1:numPeaks
-	test = get(h(iPeak),'userdata');  %gets peaks from right to left
-%    disp([num2str(iPeak) ':  ' mat2str(test)]);
-    if sum(test == [1 1 0]) > 2   %yellow
-        selected_peak = [selected_peak EKG.indxPeaks(numPeaks-(iPeak-1))];
-    end
-end
-%disp(['Selected peak(s): ' mat2str(selected_peak)]);
-% if there's more than one selected peak we have a problem
-if length(selected_peak) > 1
-    warndlg('More than one peak is selected. Try again.','Warning!');
-    return
-end
-% if there's no selected peak we have a problem
-if length(selected_peak) < 1
-    warndlg('A peak must be selected. Try again.','Warning!');
-    return
-end
 
 if obj.hasInspector()
     sampleIdx = EKG.peaks(selected_peak, 1);
-    obj.inspector.deletePeak(sampleIdx, "ui_delete");
+    obj.clearEcgPeakSelection();
+    obj.inspector.deletePeaks(sampleIdx, "ui_delete");
     return
 end
 
@@ -210,6 +167,16 @@ EKG.peaks(selected_peak,:) = [];
 
 
 EKG.t_peaks = EKG.peaks(:,1)/EKG.sampRate;
+if numel(EKG.t_peaks) < 2
+    EKG.ibis = [];
+    EKG.ibi_spline = [];
+    EKG.ibi_spline_t = [];
+    EKG.indxPeaks = find(EKG.t_peaks >= EKG.plot.startTime & EKG.t_peaks <= EKG.plot.endTime);
+    obj.drawIbiPlot();
+    obj.drawEkgPlot();
+    obj.drawPsdPlot();
+    return
+end
 EKG.ibis = 1000*diff(EKG.t_peaks); %ibi in milliseconds
 y = EKG.ibis;   %leave in ms
 x=EKG.t_peaks(2:end);
@@ -224,7 +191,7 @@ EKG.ibi_spline_t = xx+x(1);
 EKG.indxPeaks = find(EKG.t_peaks >= EKG.plot.startTime & EKG.t_peaks <= EKG.plot.endTime); 
 
 % remove 'o's if present
-h = findobj(gca,'Type','text');
+h = findobj(gca,'Type','text','-regexp','Tag','^peak[0-9]+$');
 if ~isempty(h)
     delete(h);        
 end
@@ -258,16 +225,35 @@ function drawEkgPlot(obj)
 global EKG;
 
 EKG.plot.endTime = EKG.plot.startTime + EKG.plot.widthTime;
-startSamp = floor(EKG.plot.startTime*EKG.sampRate) + 1; 
-endSamp = min(floor(EKG.plot.endTime*EKG.sampRate),length(EKG.signal)); 
-%disp([num2str(startSamp)  ' endSamp: ' num2str(endSamp)]);
-EKG.ekgMin = min(EKG.signal(startSamp:endSamp));
-if EKG.ekgMin >= 0
-    EKG.ekgMin = floor(0.9*EKG.ekgMin);
-else
-    EKG.ekgMin = floor(1.1*EKG.ekgMin);
+startSamp = floor(EKG.plot.startTime*EKG.sampRate) + 1;
+startSamp = min(max(startSamp, 1), length(EKG.signal));
+endSamp = min(floor(EKG.plot.endTime*EKG.sampRate),length(EKG.signal));
+if endSamp < startSamp
+    endSamp = startSamp;
 end
-EKG.ekgMax = ceil(1.1*max(EKG.signal));
+%disp([num2str(startSamp)  ' endSamp: ' num2str(endSamp)]);
+visibleSignal = EKG.signal(startSamp:endSamp);
+yCandidates = visibleSignal(:);
+if ~isempty(EKG.peaks)
+    visiblePeakIdx = find(EKG.t_peaks >= EKG.plot.startTime & EKG.t_peaks <= EKG.plot.endTime);
+    if ~isempty(visiblePeakIdx)
+        yCandidates = [yCandidates; EKG.peaks(visiblePeakIdx,2)];
+    end
+end
+yCandidates = yCandidates(isfinite(yCandidates));
+if isempty(yCandidates)
+    yCandidates = 0;
+end
+yMin = min(yCandidates);
+yMax = max(yCandidates);
+yRange = yMax - yMin;
+if ~isfinite(yRange) || yRange <= 0
+    yRange = max(abs(yMax), 1);
+end
+padding = 0.1 * yRange;
+EKG.ekgMin = yMin - padding;
+EKG.ekgMax = yMax + padding;
+EKG.plot.incrUpDn = 0.05 * max(EKG.ekgMax - EKG.ekgMin, eps);
 
 axes(findobj('Tag', 'AxesEkgPlot'));
 
@@ -275,6 +261,7 @@ axes(findobj('Tag', 'AxesEkgPlot'));
 % remove line if present
 
 delete(findobj('Tag', 'LineEkgData'))
+delete(findobj('Tag', 'LineEkgDataThreshold'))
 
 set(findobj('Tag', 'AxesEkgPlot'), 'XLim', [floor(EKG.plot.startTime) ceil(EKG.plot.endTime)]);
 set(findobj('Tag', 'AxesEkgPlot'), 'YLim', [EKG.ekgMin EKG.ekgMax]);
@@ -283,35 +270,16 @@ set(findobj('Tag', 'AxesEkgPlot'), 'YLim', [EKG.ekgMin EKG.ekgMax]);
 set(findobj('Tag', 'FigureEkgPlot'), 'Name', EKG.inFile); %add the file address on the figure name instead of the axes title
 
 cf = gcf;
-t = linspace(EKG.plot.startTime,min(EKG.plot.endTime,EKG.plot.maxTime),length(EKG.signal(startSamp:endSamp)));
-line(t,EKG.signal(startSamp:endSamp),'Tag', 'LineEkgData','color','blue');
+t = linspace(EKG.plot.startTime,min(EKG.plot.endTime,EKG.plot.maxTime),length(visibleSignal));
+line(t,visibleSignal,'Tag', 'LineEkgData','color','blue');
 
 % draw peaks if there are any
 if ~isempty(EKG.peaks)
 	% find selected peak if there is one
-	h = findobj(gca,'Type','text');
-	
-	% find selected peak which is red and has 'yellow' stored in userdata
-	numPeaks = numel(h);
-	%disp(['Length(h): ' num2str(numPeaks)]);
-	selected_peak = [];
-	
-	for iPeak = 1:numPeaks
-		test = get(h(iPeak),'userdata');  %gets peaks from right to left
-	%    disp([num2str(iPeak) ':  ' mat2str(test)]);
-	    if sum(test == [1 1 0]) > 2   %yellow
-	        selected_peak = [selected_peak EKG.indxPeaks(numPeaks-(iPeak-1))];
-	    end
-	end
-	%disp(['Selected peak(s): ' mat2str(selected_peak)]);
-	% if there's more than one selected peak we have a problem
-	if length(selected_peak) > 1
-	    warndlg('More than one peak is selected. Try again.','Warning!');
-	    return
-	end
+	selected_peak = obj.getSelectedEcgPeakIdx(false);
 
 	% remove 'o's if present
-	h = findobj(gca,'Type','text');
+	h = findobj(gca,'Type','text','-regexp','Tag','^peak[0-9]+$');
 	if ~isempty(h)
 		delete(h);        
     end    
@@ -321,7 +289,7 @@ if ~isempty(EKG.peaks)
     for i = 1:length(EKG.indxPeaks)
         iPeak = EKG.indxPeaks(i);
 %	    disp(num2str(iPeak));
-		if iPeak == selected_peak
+		if ismember(iPeak, selected_peak)
 			EKG.hpeaks(iPeak) = text(EKG.t_peaks(iPeak),EKG.peaks(iPeak,2),'o', ...
 				'color',[1 0 0],'userdata',[1 1 0], ...
 				'HorizontalAlignment','center','VerticalAlignment','middle', ...
@@ -346,6 +314,12 @@ if ~isempty(EKG.peaks)
     yThreshold = [EKG.threshold EKG.threshold];
     line(xThreshold,yThreshold,'color','cyan','Tag', 'LineEkgDataThreshold');
 
+else
+    h = findobj(gca,'Type','text','-regexp','Tag','^peak[0-9]+$');
+    if ~isempty(h)
+        delete(h);
+    end
+    EKG.indxPeaks = [];
 end
 %----------------------------------------darwRspPlot----------------------%
 
@@ -418,7 +392,7 @@ ibiMax = ceil(1.1*max(ibisRange));
 axes(findobj('Tag', 'AxesIbiPlot'));
 
 % remove 'o's if present
-h = findobj(gca,'Type','text');
+h = findobj(gca,'Type','text','-regexp','Tag','^ibi');
 if ~isempty(h),delete(h),end
 % remove line if present
 delete(findobj('Tag', 'LineIbiData'))
@@ -597,12 +571,40 @@ line(t,EKG.RSP.signal(startSamp:endSamp),'Tag', 'LineRspData','color','red', 'Pa
 end
 
 function exitHrv(~)
-
-
 delete(findobj('Tag', 'FigureEkgPlot'))
 delete(findobj('Tag', 'FigureEkgControl'))
 delete(findobj('Tag', 'FigureIbiPlot'))
 delete(findobj('Tag', 'FigurePsdPlot'))
+end
+
+function exitWithoutSaving(obj)
+if obj.hasInspector()
+    obj.inspector.cancelReview();
+end
+obj.exitHrv();
+end
+
+function undoReview(obj)
+if obj.hasInspector()
+    obj.inspector.undo();
+end
+end
+
+function startOverReview(obj)
+if obj.hasInspector()
+    obj.inspector.startOver();
+end
+end
+
+function clearEcgPeakSelection(~)
+hAx = findobj('Tag', 'AxesEkgPlot');
+if isempty(hAx) || ~ishandle(hAx)
+    return
+end
+h = findobj(hAx,'Type','text','-regexp','Tag','^peak[0-9]+$');
+for iPeak = 1:numel(h)
+    set(h(iPeak), 'color', [1 1 0], 'userdata', [1 0 0]);
+end
 end
 
 function findPeaks(obj)
@@ -615,11 +617,45 @@ global EKG;
 
 minSampsBetweenPeaks = 400*EKG.sampRate/1000;
 
-EKG.peaks = peakfinder(EKG.signal,EKG.threshold,minSampsBetweenPeaks);
-while isempty(EKG.peaks)
-    EKG.peaks = peakfinder(EKG.signal,EKG.threshold,minSampsBetweenPeaks);
+signalFinite = EKG.signal(isfinite(EKG.signal));
+thresholdCandidates = EKG.threshold;
+if ~isempty(signalFinite)
+    signalStd = std(signalFinite);
+    thresholdCandidates = [thresholdCandidates signalStd 0.75*signalStd 0.5*signalStd 0.25*signalStd];
 end
-    
+thresholdCandidates = thresholdCandidates(isfinite(thresholdCandidates));
+thresholdCandidates = unique(thresholdCandidates, 'stable');
+
+detectedPeaks = [];
+selectedThreshold = [];
+for iThreshold = 1:numel(thresholdCandidates)
+    try
+        candidatePeaks = peakfinder(EKG.signal, thresholdCandidates(iThreshold), minSampsBetweenPeaks);
+    catch
+        candidatePeaks = [];
+    end
+    if ~isempty(candidatePeaks) && size(candidatePeaks, 2) >= 2
+        candidatePeaks = candidatePeaks(all(isfinite(candidatePeaks(:,1:2)), 2), 1:2);
+    else
+        candidatePeaks = [];
+    end
+    if size(candidatePeaks, 1) >= 2
+        detectedPeaks = candidatePeaks;
+        selectedThreshold = thresholdCandidates(iThreshold);
+        break
+    end
+end
+
+if isempty(detectedPeaks)
+    warndlg('No ECG peaks were found. Lower the threshold or invert the ECG signal, then try again.','Warning!');
+    return
+end
+
+if obj.hasInspector()
+    obj.inspector.beginUiEdit();
+end
+EKG.threshold = selectedThreshold;
+EKG.peaks = detectedPeaks;
 EKG.t_peaks = EKG.peaks(:,1)/EKG.sampRate; %in seconds
 axes(findobj('Tag', 'AxesEkgPlot'));
 
@@ -633,13 +669,13 @@ xx=0:0.1:tMax;        % ibi interpolated to 10 Hz
 yy = spline(t,y,xx);
 EKG.ibi_spline = yy;
 EKG.ibi_spline_t = xx+x(1);
-obj.drawEkgPlot();
-obj.drawIbiPlot();
-obj.drawPsdPlot();
-
 if obj.hasInspector()
     obj.inspector.setPeaksFromUi(EKG.peaks(:,1), EKG.peaks(:,2));
 end
+
+obj.drawEkgPlot();
+obj.drawIbiPlot();
+obj.drawPsdPlot();
 end
 
 function initEkgControl(obj)
@@ -780,9 +816,9 @@ h1 = uicontrol('Parent',hpeak1, ...
     'Tag','PushbuttonAddRight');
 h1 = uicontrol('Parent',hpeak1, ...
     'Callback', @(~,~)obj.deletePeak(), ...
-    'FontSize',10, ...
+    'FontSize',8, ...
     'Position',[2 5 84 30], ...
-    'String','Delete Peak', ...
+    'String','Delete Selected', ...
     'Tag','PushbuttonDeletePeak');
 % Move Peak control panel %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 hmvpeak1 = uipanel('Parent',h0, ...
@@ -962,11 +998,32 @@ h1 = uicontrol('Parent',hrv1, ...
     'Tag','StaticTextHR');
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 h1 = uicontrol('Parent',h0, ...
-    'Callback', @(~,~)obj.exitHrv(), ...
-    'FontSize',10, ...
+    'Callback', @(~,~)obj.undoReview(), ...
+    'FontSize',9, ...
     'FontWeight','bold', ...
-    'Position',[280 10 60 30], ...
-    'String','Exit', ...
+    'Position',[8 10 52 30], ...
+    'String','Undo', ...
+    'Tag','UndoButton');
+h1 = uicontrol('Parent',h0, ...
+    'Callback', @(~,~)obj.startOverReview(), ...
+    'FontSize',9, ...
+    'FontWeight','bold', ...
+    'Position',[64 10 74 30], ...
+    'String','Start Over', ...
+    'Tag','StartOverButton');
+h1 = uicontrol('Parent',h0, ...
+    'Callback', @(~,~)obj.exitWithoutSaving(), ...
+    'FontSize',9, ...
+    'FontWeight','bold', ...
+    'Position',[142 10 96 30], ...
+    'String','Exit No Save', ...
+    'Tag','ExitNoSaveButton');
+h1 = uicontrol('Parent',h0, ...
+    'Callback', @(~,~)obj.exitHrv(), ...
+    'FontSize',9, ...
+    'FontWeight','bold', ...
+    'Position',[242 10 98 30], ...
+    'String','Save & Exit', ...
     'Tag','Exitbutton');
 end
 
@@ -1110,6 +1167,9 @@ if add_peak_sample <= 1 || add_peak_sample >= numel(EKG.signal)
     return
 end
 
+if obj.hasInspector()
+    obj.inspector.beginUiEdit();
+end
 rriPeaksIdx = [rriPeaksIdx(1:pos-1); add_peak_sample; rriPeaksIdx(pos:end)];
 obj.setRriPeaksIdx(rriPeaksIdx);
 obj.appendRriLog("insert", add_peak_sample, add_peak_sample, "ui_rri_add", "rri_peak");
@@ -1142,6 +1202,9 @@ if isempty(pos) || pos <= 1
     return
 end
 
+if obj.hasInspector()
+    obj.inspector.beginUiEdit();
+end
 invalidIdx = obj.getRriInvalidIdx();
 invalidIdx(end+1,1) = selected_sample;
 obj.setRriInvalidIdx(invalidIdx);
@@ -1189,6 +1252,9 @@ if newSampleIdx <= prevSample || newSampleIdx >= nextSample || newSampleIdx < 1
     return
 end
 
+if obj.hasInspector()
+    obj.inspector.beginUiEdit();
+end
 rriPeaksIdx(pos) = newSampleIdx;
 obj.setRriPeaksIdx(rriPeaksIdx);
 invalidIdx = obj.getRriInvalidIdx();
@@ -1246,6 +1312,9 @@ if newSampleIdx < 1 || newSampleIdx > numel(EKG.signal)
     return
 end
 
+if obj.hasInspector()
+    obj.inspector.beginUiEdit();
+end
 rriPeaksIdx(pos) = newSampleIdx;
 obj.setRriPeaksIdx(rriPeaksIdx);
 invalidIdx = obj.getRriInvalidIdx();
@@ -1276,7 +1345,7 @@ if isempty(hAx) || ~ishandle(hAx)
     return
 end
 axes(hAx);
-h = findobj(gca,'Type','text');
+h = findobj(gca,'Type','text','-regexp','Tag','^ibi[0-9]+$');
 numPeaks = numel(h);
 for iPeak = 1:numPeaks
 	test = get(h(iPeak),'userdata');
@@ -1513,34 +1582,12 @@ function movePeak(obj, direction)
 
 global EKG;
 
+selected_peak = obj.getSingleSelectedEcgPeakIdx(true);
+if isempty(selected_peak)
+    return
+end
+
 axes(findobj('Tag', 'AxesEkgPlot'));
-
-% find 'o's if present
-h = findobj(gca,'Type','text');
-
-% find selected peak which is red and has 'yellow' stored in userdata
-numPeaks = numel(h);
-%disp(['Length(h): ' num2str(numPeaks)]);
-selected_peak = [];
-
-for iPeak = 1:numPeaks
-	test = get(h(iPeak),'userdata');  %gets peaks from right to left
-%    disp([num2str(iPeak) ':  ' mat2str(test)]);
-    if sum(test == [1 1 0]) > 2   %yellow
-        selected_peak = [selected_peak EKG.indxPeaks(numPeaks-(iPeak-1))];
-    end                           
-end
-%disp(['Selected peak(s): ' mat2str(selected_peak)]);
-% if there's more than one selected peak we have a problem
-if length(selected_peak) > 1
-    warndlg('More than one peak is selected. Try again.','Warning!');
-    return
-end
-% if there's no selected peak we have a problem
-if length(selected_peak) < 1
-    warndlg('A peak must be selected. Try again.','Warning!');
-    return
-end
 
 if obj.hasInspector()
     oldSampleIdx = EKG.peaks(selected_peak, 1);
@@ -1683,24 +1730,9 @@ function moveSelectedPeak(obj)
 
 global EKG;
 
+selected_peak = obj.getSelectedEcgPeakIdx(false);
+
 axes(findobj('Tag', 'AxesEkgPlot'));
-
-% find 'o's if present
-h = findobj(gca,'Type','text');
-
-% find selected peak which is red and has 'yellow' stored in userdata
-numPeaks = numel(h);
-%disp(['Length(h): ' num2str(numPeaks)]);
-selected_peak = [];
-
-for iPeak = 1:numPeaks
-	test = get(h(iPeak),'userdata');  %gets peaks from right to left
-%    disp([num2str(iPeak) ':  ' mat2str(test)]);
-    if sum(test == [1 1 0]) > 2   %yellow
-        selected_peak = [selected_peak EKG.indxPeaks(numPeaks-(iPeak-1))];
-    end   
-end
-
 newPeakPosition  = get(gca,'CurrentPoint');
 newPeakPositionX = newPeakPosition(1,1);
 newPeakPositionY = newPeakPosition(1,2);
@@ -1710,10 +1742,10 @@ newPeakPositionY = newPeakPosition(1,2);
 %  a = EKG.peaks(selected_peak,1)/EKG.sampRate
 %     b = newPeakPositionX
     
-if (length(selected_peak) >= 1);
-    
-    
-% if there's more than one selected peak we have a problem
+if isempty(selected_peak)
+    return
+end
+
 if length(selected_peak) > 1
     warndlg('More than one peak is selected. Try again.','Warning!');
     return
@@ -1774,7 +1806,6 @@ obj.drawPsdPlot();
 end
 
 
-end
 end
 
 function moveThreshold(~, x)
@@ -1984,6 +2015,52 @@ end
     methods (Access=private)
         function tf = hasInspector(obj)
             tf = ~isempty(obj.inspector) && isvalid(obj.inspector);
+        end
+
+        function selected_peak = getSelectedEcgPeakIdx(~, warnIfEmpty)
+            if nargin < 2
+                warnIfEmpty = true;
+            end
+
+            global EKG;
+            selected_peak = [];
+            hAx = findobj('Tag', 'AxesEkgPlot');
+            if isempty(hAx) || ~ishandle(hAx(1)) || isempty(EKG) || ~isfield(EKG, 'indxPeaks')
+                if warnIfEmpty
+                    warndlg('A peak must be selected. Try again.','Warning!');
+                end
+                return
+            end
+
+            hAx = hAx(1);
+            h = findobj(hAx,'Type','text','-regexp','Tag','^peak[0-9]+$');
+            numPeaks = numel(h);
+            for iPeak = 1:numPeaks
+                test = get(h(iPeak),'userdata');  % gets peaks from right to left
+                if isnumeric(test) && numel(test) == 3 && sum(test == [1 1 0]) > 2
+                    peakPos = numPeaks-(iPeak-1);
+                    if peakPos >= 1 && peakPos <= numel(EKG.indxPeaks)
+                        selected_peak = [selected_peak EKG.indxPeaks(peakPos)]; %#ok<AGROW>
+                    end
+                end
+            end
+
+            selected_peak = unique(selected_peak, 'stable');
+            if isempty(selected_peak) && warnIfEmpty
+                warndlg('A peak must be selected. Try again.','Warning!');
+            end
+        end
+
+        function selected_peak = getSingleSelectedEcgPeakIdx(obj, warnIfEmpty)
+            if nargin < 2
+                warnIfEmpty = true;
+            end
+
+            selected_peak = obj.getSelectedEcgPeakIdx(warnIfEmpty);
+            if numel(selected_peak) > 1
+                warndlg('More than one peak is selected. Try again.','Warning!');
+                selected_peak = [];
+            end
         end
 
         function appendRriLog(obj, action, peakBefore, peakAfter, note, editTarget)
