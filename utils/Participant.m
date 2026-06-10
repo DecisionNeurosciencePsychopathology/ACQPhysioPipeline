@@ -3,6 +3,7 @@ classdef Participant < handle
         defaultSourcesToExtract = {'ECG','EDA'};
         saveDirectoryName = fullfile("DataProcessed","ByParticipant")
         overrideSaveDirPath = ""
+        overrideSaveDirPath = ""
     end
 
     properties 
@@ -19,6 +20,7 @@ classdef Participant < handle
         taskSegmentation
         sourcesToExtract = Participant.defaultSourcesToExtract
         segmentationProvided 
+        rriBaselineWindowSec = []
         rriBaselineWindowSec = []
     end
     
@@ -49,6 +51,9 @@ classdef Participant < handle
                 opts.baselineDurationSec (1,1) double = 300
                 opts.baselineMethod (1,1) string = "preFirstEvent"
                 opts.baselineFallbackMethod (1,1) string = "firstAvailable"
+                opts.baselineDurationSec (1,1) double = 300
+                opts.baselineMethod (1,1) string = "preFirstEvent"
+                opts.baselineFallbackMethod (1,1) string = "firstAvailable"
             end
 
             obj.saveResults = Participant.parseSaveSelection(opts.save);
@@ -75,6 +80,10 @@ classdef Participant < handle
             obj.printPandaLastEventTime(opts.ecgArtifactRejectionMethod);
             obj.preprocessData(opts);
             obj.segmentData();
+            obj.extractHrvFeatures( ...
+                baselineDurationSec = opts.baselineDurationSec, ...
+                baselineMethod = opts.baselineMethod, ...
+                baselineFallbackMethod = opts.baselineFallbackMethod);
             obj.extractHrvFeatures( ...
                 baselineDurationSec = opts.baselineDurationSec, ...
                 baselineMethod = opts.baselineMethod, ...
@@ -168,11 +177,16 @@ classdef Participant < handle
                 opts.minDurationForSpectrumSec (1,1) double = 1
                 opts.interpHz (1,1) double = 4
                 opts.baselineWindowSec = []
+                opts.baselineWindowSec = []
             end
 
             eventArray = [];
             if ~isempty(obj.acqParser)
                 eventArray = obj.acqParser.TTLsummary;
+            end
+
+            if isempty(opts.baselineWindowSec) && ~isempty(obj.rriBaselineWindowSec)
+                opts.baselineWindowSec = obj.rriBaselineWindowSec;
             end
 
             if isempty(opts.baselineWindowSec) && ~isempty(obj.rriBaselineWindowSec)
@@ -631,6 +645,78 @@ classdef Participant < handle
     end
     
     methods (Static, Access=private)
+        function token = normalizeOptionToken(rawValue)
+            token = lower(regexprep(strtrim(string(rawValue)), '[\s_\-]', ''));
+            token = token(:);
+            token = token(token ~= "");
+            if isempty(token)
+                token = "";
+            else
+                token = token(1);
+            end
+        end
+
+        function [baselineWindowSec, hasWindow] = computeFirstAvailableBaselineWindow( ...
+                recordingEndSec, baselineDurationSec)
+            endSec = min(recordingEndSec, baselineDurationSec);
+            baselineWindowSec = [0, endSec];
+            hasWindow = endSec > 0;
+            if ~hasWindow
+                baselineWindowSec = [];
+            end
+        end
+
+        function [baselineWindowSec, hasWindow] = computeLastAvailableBaselineWindow( ...
+                recordingEndSec, baselineDurationSec)
+            startSec = max(0, recordingEndSec - baselineDurationSec);
+            baselineWindowSec = [startSec, recordingEndSec];
+            hasWindow = recordingEndSec > startSec;
+            if ~hasWindow
+                baselineWindowSec = [];
+            end
+        end
+
+        function [baselineWindowSec, hasWindow] = computeFallbackBaselineWindow( ...
+                recordingEndSec, baselineDurationSec, fallbackMethod)
+            switch fallbackMethod
+                case {"firstavailable", "fromstart", "start", ""}
+                    [baselineWindowSec, hasWindow] = Participant.computeFirstAvailableBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+                case {"lastavailable", "fromend", "end"}
+                    [baselineWindowSec, hasWindow] = Participant.computeLastAvailableBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+                case {"fullrecording", "all", "entire"}
+                    baselineWindowSec = [0, recordingEndSec];
+                    hasWindow = recordingEndSec > 0;
+                case {"none", "off"}
+                    baselineWindowSec = [];
+                    hasWindow = false;
+                otherwise
+                    warning('Participant:UnknownBaselineFallbackMethod', ...
+                        'Unknown baselineFallbackMethod "%s"; using firstAvailable.', fallbackMethod);
+                    [baselineWindowSec, hasWindow] = Participant.computeFirstAvailableBaselineWindow( ...
+                        recordingEndSec, baselineDurationSec);
+            end
+        end
+
+        function baselineWindowSec = clampBaselineWindow(baselineWindowSec, minSec, maxSec)
+            if isempty(baselineWindowSec)
+                return
+            end
+
+            baselineWindowSec = double(baselineWindowSec(:).');
+            if numel(baselineWindowSec) ~= 2 || any(~isfinite(baselineWindowSec))
+                baselineWindowSec = [];
+                return
+            end
+
+            baselineWindowSec(1) = max(minSec, baselineWindowSec(1));
+            baselineWindowSec(2) = min(maxSec, baselineWindowSec(2));
+            if baselineWindowSec(2) <= baselineWindowSec(1)
+                baselineWindowSec = [];
+            end
+        end
+
         function token = normalizeOptionToken(rawValue)
             token = lower(regexprep(strtrim(string(rawValue)), '[\s_\-]', ''));
             token = token(:);
